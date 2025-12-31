@@ -1,0 +1,46 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Distribution / packaging
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+wheels/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Model checkpoints and logs
+*.ckpt
+*.pt
+*.pth
+wandb/
+lightning_logs/
+outputs/
+checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment variables
+.env
+.env.local
+
