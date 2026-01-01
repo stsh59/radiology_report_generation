@@ -40,6 +40,8 @@ class MultiViewDataset(Dataset):
         # Rate-limit warnings to avoid log spam
         self._image_load_warning_count = 0
         self._max_image_load_warnings = 20
+        self._view_pos_warning_count = 0
+        self._max_view_pos_warnings = 5  # Fewer warnings for this known issue
         
         # Transforms: Medical-appropriate augmentation for training
         # Use explicit is_train if provided; fallback to filename heuristic for backward compatibility
@@ -160,12 +162,12 @@ class MultiViewDataset(Dataset):
 
         # Validate alignment between paths and positions (log only; do not crash by default)
         if isinstance(image_paths, list) and raw_view_positions and (len(raw_view_positions) != len(image_paths)):
-            if self._image_load_warning_count < self._max_image_load_warnings:
+            if self._view_pos_warning_count < self._max_view_pos_warnings:
                 logger.warning(
                     f"view_positions length ({len(raw_view_positions)}) != image_paths length ({len(image_paths)}) "
                     f"for index={idx}. Using per-slot masking/PAD mapping."
                 )
-                self._image_load_warning_count += 1
+                self._view_pos_warning_count += 1
         
         view_pos_ids = []
         for i in range(self.max_views):
@@ -204,19 +206,18 @@ class MultiViewDataset(Dataset):
             # Span sampling operates on the FULL tokenized report first, then slices.
             # - Train: random span (improves contrastive alignment)
             # - Val/Test: deterministic span (start at 0) for reproducibility
-            # Use add_special_tokens=False to get raw tokens, then add BOS/EOS manually if needed
-            # Truncate to a large limit first to avoid warning, then slice to max_length
+            # Tokenize without special tokens first for slicing
             full_encoded = self.tokenizer(
                 report_str,
                 truncation=True,
-                max_length=4096,  # Large limit to capture full report without warning
+                max_length=4096,
                 return_tensors="pt",
-                add_special_tokens=False  # Handle special tokens after slicing
+                add_special_tokens=False
             )
             full_ids = full_encoded['input_ids'].squeeze(0)
             
-            # Reserve space for BOS/EOS tokens (SigLIP uses them)
-            effective_max = self.max_length - 2  # Reserve 2 for special tokens
+            # SigLIP uses EOS (id=1) but no BOS - reserve 1 slot
+            effective_max = self.max_length - 1
             
             if len(full_ids) > effective_max:
                 max_start = len(full_ids) - effective_max
@@ -229,18 +230,18 @@ class MultiViewDataset(Dataset):
             else:
                 sliced_ids = full_ids
             
-            # Add BOS and EOS tokens
-            bos_id = self.tokenizer.bos_token_id if self.tokenizer.bos_token_id is not None else self.tokenizer.cls_token_id
-            eos_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else self.tokenizer.sep_token_id
-            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            # Add EOS token at end (SigLIP uses token_id=1 as EOS)
+            eos_id = self.tokenizer.eos_token_id
+            if eos_id is None:
+                eos_id = 1  # SigLIP default
             
-            # Build final sequence: [BOS] + tokens + [EOS] + [PAD...]
-            tokens_list = []
-            if bos_id is not None:
-                tokens_list.append(bos_id)
-            tokens_list.extend(sliced_ids.tolist())
-            if eos_id is not None:
-                tokens_list.append(eos_id)
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None:
+                pad_id = 0
+            
+            # Build sequence: tokens + [EOS] + [PAD...]
+            tokens_list = sliced_ids.tolist()
+            tokens_list.append(eos_id)
             
             # Pad to max_length
             if len(tokens_list) < self.max_length:

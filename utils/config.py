@@ -31,7 +31,7 @@ MAX_GENERATION_LENGTH = 512
 
 # Training hyperparameters - STAGE-SPECIFIC
 BATCH_SIZE = 4
-BATCH_SIZE_STAGE1 = 8  # Larger for contrastive (more negatives)
+BATCH_SIZE_STAGE1 = 16  # 24GB VRAM allows larger batch for more negatives
 BATCH_SIZE_STAGE2 = 4  # Smaller for generation (memory)
 
 LEARNING_RATE_STAGE1 = 1e-4
