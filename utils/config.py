@@ -32,29 +32,29 @@ MAX_GENERATION_LENGTH = 512
 # Training hyperparameters - STAGE-SPECIFIC
 BATCH_SIZE = 4
 BATCH_SIZE_STAGE1 = 16  # 24GB VRAM allows larger batch for more negatives
-BATCH_SIZE_STAGE2 = 4  # Smaller for generation (memory)
+BATCH_SIZE_STAGE2 = 6  # Optimized for 24GB VRAM
 
 LEARNING_RATE_STAGE1 = 1e-4
-LEARNING_RATE_STAGE2 = 5e-5  # Lower for generation stability
+LEARNING_RATE_STAGE2 = 2e-5  # Lower for better generation quality
 
 NUM_EPOCHS_STAGE1 = 10
-NUM_EPOCHS_STAGE2 = 25  # More epochs for generation
+NUM_EPOCHS_STAGE2 = 15  # Early stopping handles convergence
 
 WARMUP_STEPS_STAGE1 = 1500  # Increased for stable LoRA adaptation with quantization
-WARMUP_STEPS_STAGE2 = 2000  # Longer warmup for generation
+WARMUP_STEPS_STAGE2 = 750  # Balanced warmup for faster convergence
 
 # Contrastive learning temperature (higher = softer distribution, more stable with quantization)
 TEMPERATURE_STAGE1 = 0.1
 
 WEIGHT_DECAY = 0.01
 GRADIENT_ACCUMULATION_STEPS_STAGE1 = 8  # Effective batch 64
-GRADIENT_ACCUMULATION_STEPS_STAGE2 = 4
+GRADIENT_ACCUMULATION_STEPS_STAGE2 = 2  # Effective batch = 12
 
 # PEFT configurations - SEPARATE for vision and LLM
 LORA_R_VISION = 16
 LORA_ALPHA_VISION = 32
-LORA_R_LLM = 64        # Higher capacity for text generation
-LORA_ALPHA_LLM = 128   # Scaled with rank
+LORA_R_LLM = 32        # Balanced capacity (prevents overfitting)
+LORA_ALPHA_LLM = 64    # Keep 2× rank ratio
 LORA_DROPOUT = 0.1
 LORA_TARGET_MODULES_VISION = ["q_proj", "v_proj", "k_proj", "out_proj"]
 LORA_TARGET_MODULES_LLM = ["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"]
@@ -67,7 +67,7 @@ LORA_ALPHA = LORA_ALPHA_VISION
 NUM_PROJECTION_QUERIES = 64    # Increased from 32
 PROJECTION_LAYERS = 4          # Increased from 2
 PROJECTION_HEADS = 8
-PROJECTION_DROPOUT = 0.15      # Slightly higher for regularization
+PROJECTION_DROPOUT = 0.1       # Standard dropout
 
 # Generation parameters - PURE BEAM SEARCH (Deterministic for medical applications)
 GENERATION_NUM_BEAMS = 5           # Slightly more beams for better quality
