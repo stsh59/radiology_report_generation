@@ -204,28 +204,50 @@ class MultiViewDataset(Dataset):
             # Span sampling operates on the FULL tokenized report first, then slices.
             # - Train: random span (improves contrastive alignment)
             # - Val/Test: deterministic span (start at 0) for reproducibility
+            # Use add_special_tokens=False to get raw tokens, then add BOS/EOS manually if needed
+            # Truncate to a large limit first to avoid warning, then slice to max_length
             full_encoded = self.tokenizer(
                 report_str,
-                truncation=False,
-                return_tensors="pt"
+                truncation=True,
+                max_length=4096,  # Large limit to capture full report without warning
+                return_tensors="pt",
+                add_special_tokens=False  # Handle special tokens after slicing
             )
             full_ids = full_encoded['input_ids'].squeeze(0)
             
-            if len(full_ids) > self.max_length:
-                max_start = len(full_ids) - self.max_length
+            # Reserve space for BOS/EOS tokens (SigLIP uses them)
+            effective_max = self.max_length - 2  # Reserve 2 for special tokens
+            
+            if len(full_ids) > effective_max:
+                max_start = len(full_ids) - effective_max
                 if self.is_train:
                     import random
                     start_idx = random.randint(0, max_start)
                 else:
                     start_idx = 0
-                input_ids = full_ids[start_idx:start_idx + self.max_length]
+                sliced_ids = full_ids[start_idx:start_idx + effective_max]
             else:
-                # Short report: use all, pad to max_length
-                input_ids = full_ids
-                if len(input_ids) < self.max_length:
-                    pad_len = self.max_length - len(input_ids)
-                    pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-                    input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id, dtype=input_ids.dtype)])
+                sliced_ids = full_ids
+            
+            # Add BOS and EOS tokens
+            bos_id = self.tokenizer.bos_token_id if self.tokenizer.bos_token_id is not None else self.tokenizer.cls_token_id
+            eos_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else self.tokenizer.sep_token_id
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            
+            # Build final sequence: [BOS] + tokens + [EOS] + [PAD...]
+            tokens_list = []
+            if bos_id is not None:
+                tokens_list.append(bos_id)
+            tokens_list.extend(sliced_ids.tolist())
+            if eos_id is not None:
+                tokens_list.append(eos_id)
+            
+            # Pad to max_length
+            if len(tokens_list) < self.max_length:
+                pad_len = self.max_length - len(tokens_list)
+                tokens_list.extend([pad_id] * pad_len)
+            
+            input_ids = torch.tensor(tokens_list[:self.max_length], dtype=torch.long)
         else:
             # Standard tokenization: first max_length tokens (deterministic)
             text_encoded = self.tokenizer(

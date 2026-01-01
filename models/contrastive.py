@@ -71,7 +71,7 @@ class MedicalSigLIPLightning(pl.LightningModule):
         self.criterion = ContrastiveLoss(temperature=temperature)
         count_trainable_parameters(self.model)
 
-    def forward(self, pixel_values, input_ids, attention_mask=None):
+    def forward(self, pixel_values, input_ids, attention_mask=None, view_mask=None):
         # 1. Image Encoding (Multi-View)
         # pixel_values: (B, V, C, H, W)
         b, v, c, h, w = pixel_values.shape
@@ -80,8 +80,14 @@ class MedicalSigLIPLightning(pl.LightningModule):
         # Get pooled features for contrastive
         image_features = self.model.get_image_features(pixel_values=pixel_values_flat) # (B*V, D)
         
-        # Average Pooling across views
-        image_features = image_features.view(b, v, -1).mean(dim=1) # (B, D)
+        # Masked averaging across views (only valid views, not padded black images)
+        image_features = image_features.view(b, v, -1)  # (B, V, D)
+        if view_mask is not None:
+            # view_mask: (B, V) where 1=valid, 0=padding
+            mask = view_mask.unsqueeze(-1).float()  # (B, V, 1)
+            image_features = (image_features * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        else:
+            image_features = image_features.mean(dim=1)  # (B, D)
         
         # 2. Text Encoding
         # SigLIP's text model expects input_ids usually.
@@ -101,13 +107,14 @@ class MedicalSigLIPLightning(pl.LightningModule):
             pixel_values = batch['pixel_values']
             input_ids = batch['input_ids']
             attention_mask = batch.get('attention_mask')
+            view_mask = batch.get('view_mask')
         else:
              # Fallback
              pixel_values, texts, meta = batch
-             # Note: Old code tokenized inside training_step, but we prefer DataModule to do it.
-             # Assuming DataModule does it now for robustness.
+             attention_mask = None
+             view_mask = None
 
-        image_embeds, text_embeds = self(pixel_values, input_ids, attention_mask=attention_mask if isinstance(batch, dict) else None)
+        image_embeds, text_embeds = self(pixel_values, input_ids, attention_mask=attention_mask, view_mask=view_mask)
         loss = self.criterion(image_embeds, text_embeds)
         
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -118,8 +125,13 @@ class MedicalSigLIPLightning(pl.LightningModule):
             pixel_values = batch['pixel_values']
             input_ids = batch['input_ids']
             attention_mask = batch.get('attention_mask')
+            view_mask = batch.get('view_mask')
+        else:
+            pixel_values, texts, meta = batch
+            attention_mask = None
+            view_mask = None
         
-        image_embeds, text_embeds = self(pixel_values, input_ids, attention_mask=attention_mask if isinstance(batch, dict) else None)
+        image_embeds, text_embeds = self(pixel_values, input_ids, attention_mask=attention_mask, view_mask=view_mask)
         loss = self.criterion(image_embeds, text_embeds)
         self.log('val_loss', loss, on_epoch=True, prog_bar=True)
         return loss

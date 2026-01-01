@@ -7,16 +7,11 @@ from pathlib import Path
 
 # Base paths
 PROJECT_ROOT = Path(__file__).parent.parent
-# DATA_ROOT: Override via DATA_ROOT env var; default is original path for backward compatibility
-DATA_ROOT = Path(os.environ.get(
-    "DATA_ROOT",
-    "/home/sb2ek/.cache/kagglehub/datasets/raddar/chest-xrays-indiana-university/versions/2"
-))
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 
 # Data paths - MIMIC-CXR Multi-View
-IMAGES_DIR_MIMIC = DATA_ROOT / "mimic-cxr-dataset"
+IMAGES_DIR_MIMIC = PROJECT_ROOT
 MIMIC_TRAIN_CSV = PROJECT_ROOT / "multiview_train.csv"
 MIMIC_VAL_CSV = PROJECT_ROOT / "multiview_val.csv"
 MIMIC_TEST_CSV = PROJECT_ROOT / "multiview_test.csv"
@@ -45,8 +40,11 @@ LEARNING_RATE_STAGE2 = 5e-5  # Lower for generation stability
 NUM_EPOCHS_STAGE1 = 10
 NUM_EPOCHS_STAGE2 = 25  # More epochs for generation
 
-WARMUP_STEPS_STAGE1 = 500
+WARMUP_STEPS_STAGE1 = 1500  # Increased for stable LoRA adaptation with quantization
 WARMUP_STEPS_STAGE2 = 2000  # Longer warmup for generation
+
+# Contrastive learning temperature (higher = softer distribution, more stable with quantization)
+TEMPERATURE_STAGE1 = 0.1
 
 WEIGHT_DECAY = 0.01
 GRADIENT_ACCUMULATION_STEPS_STAGE1 = 8  # Effective batch 64

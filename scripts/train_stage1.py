@@ -2,12 +2,14 @@
 Stage 1 Training Script: Contrastive Pretraining.
 OPTIMIZED with stage-specific hyperparameters and early stopping.
 """
+import sys
+import os
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 from pathlib import Path
 import argparse
-
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from utils.config import *
 from data.datamodule import MultiViewDataModule
 from models.contrastive import MedicalSigLIPLightning
@@ -49,7 +51,8 @@ def main(args):
         model_name=SIGLIP_MODEL_NAME,
         learning_rate=args.lr,
         weight_decay=WEIGHT_DECAY,
-        warmup_steps=WARMUP_STEPS_STAGE1
+        warmup_steps=WARMUP_STEPS_STAGE1,
+        temperature=TEMPERATURE_STAGE1
     )
     
     # Callbacks
