@@ -37,8 +37,8 @@ BATCH_SIZE_STAGE2 = 6  # Optimized for 24GB VRAM
 LEARNING_RATE_STAGE1 = 1e-4
 LEARNING_RATE_STAGE2 = 2e-5  # Lower for better generation quality
 
-NUM_EPOCHS_STAGE1 = 10
-NUM_EPOCHS_STAGE2 = 15  # Early stopping handles convergence
+NUM_EPOCHS_STAGE1 = 20
+NUM_EPOCHS_STAGE2 = 20  # Early stopping handles convergence
 
 WARMUP_STEPS_STAGE1 = 1500  # Increased for stable LoRA adaptation with quantization
 WARMUP_STEPS_STAGE2 = 750  # Balanced warmup for faster convergence
