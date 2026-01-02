@@ -61,30 +61,33 @@ def main(args):
         image_root=str(IMAGES_DIR_MIMIC)
     )
     
+    # Detect LoRA in Stage 1 checkpoint BEFORE model creation (for proper hparam saving)
+    stage1_has_lora = False
+    stage1_state = None
+    if args.stage1_checkpoint:
+        logger.info(f"Pre-loading Stage 1 checkpoint to detect LoRA: {args.stage1_checkpoint}")
+        stage1_state = torch.load(args.stage1_checkpoint, map_location=DEVICE)
+        if 'state_dict' in stage1_state:
+            stage1_state = stage1_state['state_dict']
+        stage1_has_lora = any(("lora_" in k) or ("lora_A" in k) or ("lora_B" in k) for k in stage1_state.keys())
+        if stage1_has_lora:
+            logger.info("Stage 1 checkpoint contains LoRA adapter weights. Will create model with vision_lora_enabled=True.")
+    
     # Model (uses config defaults for LR, warmup, Perceiver)
+    # Pass vision_lora_enabled=True if Stage 1 has LoRA (this saves to hparams for checkpoint loading)
     logger.info("Initializing Model (ReportGen)...")
     model = ReportGenLightning(
         siglip_model_name=SIGLIP_MODEL_NAME,
         biogpt_model_name=BIOGPT_MODEL_NAME,
         learning_rate=args.lr,
         warmup_steps=WARMUP_STEPS_STAGE2,
-        freeze_vision=not args.unfreeze_vision
+        freeze_vision=not args.unfreeze_vision,
+        vision_lora_enabled=stage1_has_lora
     )
     
-    # Load Stage 1 checkpoint if provided
-    if args.stage1_checkpoint:
+    # Load Stage 1 checkpoint weights if provided
+    if args.stage1_checkpoint and stage1_state is not None:
         logger.info(f"Loading Stage 1 weights from {args.stage1_checkpoint}")
-        stage1_state = torch.load(args.stage1_checkpoint, map_location=DEVICE)
-        if 'state_dict' in stage1_state:
-            stage1_state = stage1_state['state_dict']
-
-        # Detect whether the Stage-1 checkpoint contains LoRA adapter weights
-        stage1_has_lora = any(("lora_" in k) or ("lora_A" in k) or ("lora_B" in k) for k in stage1_state.keys())
-        if stage1_has_lora:
-            logger.info("Stage 1 checkpoint appears to contain LoRA adapter weights. Wrapping Stage 2 vision encoder with LoRA before loading...")
-            from models.peft_config import get_lora_config, apply_lora
-            lora_config = get_lora_config(model_type="vision")
-            model.vision_encoder.model = apply_lora(model.vision_encoder.model, lora_config)
 
         # Build canonical -> tensor mapping from Stage-1
         source_by_canon = {}

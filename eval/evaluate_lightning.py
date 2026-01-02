@@ -84,6 +84,22 @@ def evaluate_model(checkpoint_path: str, split: str = 'test', output_dir: Path =
     # but load_from_checkpoint calls init.
     model = ReportGenLightning.load_from_checkpoint(checkpoint_path, strict=False)
     
+    # Validate LoRA architecture restoration
+    vision_lora_enabled = getattr(model.hparams, 'vision_lora_enabled', False)
+    logger.info(f"Vision LoRA enabled (from checkpoint hparams): {vision_lora_enabled}")
+    
+    # Check if vision encoder is properly wrapped with PEFT
+    vision_model_type = type(model.vision_encoder.model).__name__
+    logger.info(f"Vision encoder model type: {vision_model_type}")
+    
+    if vision_lora_enabled:
+        # Verify PEFT wrapper is present
+        if 'Peft' in vision_model_type or hasattr(model.vision_encoder.model, 'get_base_model'):
+            lora_param_count = sum(1 for name, _ in model.vision_encoder.model.named_parameters() if 'lora_' in name)
+            logger.info(f"✅ Vision LoRA architecture restored. LoRA parameters: {lora_param_count}")
+        else:
+            logger.warning("⚠️ vision_lora_enabled=True but vision encoder is NOT wrapped with PEFT!")
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     model.eval()

@@ -113,7 +113,8 @@ class ReportGenLightning(pl.LightningModule):
         learning_rate: float = None,  # Will use config default
         warmup_steps: int = None,  # Will use config default
         freeze_vision: bool = True,
-        use_qlora: bool = True
+        use_qlora: bool = True,
+        vision_lora_enabled: bool = False  # Track if vision encoder uses LoRA
     ):
         super().__init__()
         
@@ -132,6 +133,11 @@ class ReportGenLightning(pl.LightningModule):
         
         # 1. Vision Encoder (SigLIP)
         self.vision_encoder = SigLIPEncoder(siglip_model_name)
+        
+        # Apply LoRA to vision encoder if enabled (for checkpoint compatibility)
+        if vision_lora_enabled:
+            lora_config_vision = get_lora_config(model_type="vision")
+            self.vision_encoder.model = apply_lora(self.vision_encoder.model, lora_config_vision)
         
         if freeze_vision:
             for p in self.vision_encoder.parameters():
