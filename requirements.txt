@@ -20,6 +20,7 @@ nltk>=3.8.1
 rouge-score>=0.1.2
 pycocoevalcap>=1.2
 open_clip_torch>=2.23.0
+bert-score>=0.3.13
 
 # Utilities
 PyYAML>=6.0
