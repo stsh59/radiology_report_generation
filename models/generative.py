@@ -74,35 +74,57 @@ class BioGPTGenerator(torch.nn.Module):
         return outputs
 
     def generate(self, image_embeds, max_length=None, **kwargs):
-        # Import config for generation parameters
+        """
+        Generate medical reports from image embeddings.
+        
+        Architecture: [image_embeds][BOS] -> generated_tokens
+        BOS is appended AFTER images to match training pattern [images][text].
+        """
         from utils.config import (
-            MAX_GENERATION_LENGTH, GENERATION_NUM_BEAMS, GENERATION_DO_SAMPLE,
-            GENERATION_REPETITION_PENALTY, GENERATION_NO_REPEAT_NGRAM_SIZE, 
-            GENERATION_LENGTH_PENALTY, GENERATION_EARLY_STOPPING
+            MAX_GENERATION_LENGTH, GENERATION_NUM_BEAMS,
+            GENERATION_REPETITION_PENALTY, GENERATION_NO_REPEAT_NGRAM_SIZE
         )
         
         max_length = max_length or MAX_GENERATION_LENGTH
-        
-        # Create attention mask for images
         B, Img_Len, Dim = image_embeds.shape
-        image_attention_mask = torch.ones((B, Img_Len), device=image_embeds.device).long()
         
-        # PURE BEAM SEARCH (Deterministic for medical applications)
+        # === BOS Token: Appended AFTER images ===
+        # The model is trained on [images][text], so BOS marks the start of text generation
+        bos_token_id = self.tokenizer.bos_token_id
+        if bos_token_id is None:
+            bos_token_id = self.tokenizer.eos_token_id  # BioGPT fallback
+        
+        bos_tokens = torch.full((B, 1), bos_token_id, dtype=torch.long, device=image_embeds.device)
+        bos_embeds = self.model.biogpt.embed_tokens(bos_tokens)  # (B, 1, Dim)
+        
+        # Concatenate: [image_embeds][bos_embed] - BOS after images
+        combined_embeds = torch.cat([image_embeds, bos_embeds], dim=1)
+        input_length = Img_Len + 1  # Track for output slicing
+        
+        combined_attention_mask = torch.ones((B, input_length), device=image_embeds.device).long()
+        
+        # === Optimized Generation Parameters (based on report length analysis) ===
         outputs = self.model.generate(
-            inputs_embeds=image_embeds,
-            attention_mask=image_attention_mask,
-            max_length=max_length,
+            inputs_embeds=combined_embeds,
+            attention_mask=combined_attention_mask,
+            max_new_tokens=max_length,
+            min_new_tokens=20,           # Safeguard: at least ~80 chars, prevents empty outputs
+            early_stopping=False,        # Explore all beams for best medical accuracy
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
             num_beams=kwargs.get('num_beams', GENERATION_NUM_BEAMS),
-            do_sample=kwargs.get('do_sample', GENERATION_DO_SAMPLE),  # False
+            do_sample=False,             # Deterministic for medical applications
             repetition_penalty=kwargs.get('repetition_penalty', GENERATION_REPETITION_PENALTY),
             no_repeat_ngram_size=kwargs.get('no_repeat_ngram_size', GENERATION_NO_REPEAT_NGRAM_SIZE),
-            length_penalty=kwargs.get('length_penalty', GENERATION_LENGTH_PENALTY),
-            early_stopping=kwargs.get('early_stopping', GENERATION_EARLY_STOPPING)
+            length_penalty=1.0,          # Neutral: let model decide natural length
         )
         
-        return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        # === Output Slicing: Remove placeholder positions ===
+        # First `input_length` positions are filled with pad_token_id (placeholders for embeddings)
+        # Only positions after that contain actual generated token IDs
+        generated_ids = outputs[:, input_length:]
+        
+        return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
 class ReportGenLightning(pl.LightningModule):
     def __init__(
@@ -112,9 +134,10 @@ class ReportGenLightning(pl.LightningModule):
         num_queries: int = None,  # Will use config default
         learning_rate: float = None,  # Will use config default
         warmup_steps: int = None,  # Will use config default
-        freeze_vision: bool = True,
+        freeze_vision: bool = None,  # None = auto-detect based on stage1_checkpoint_provided
         use_qlora: bool = True,
-        vision_lora_enabled: bool = False  # Track if vision encoder uses LoRA
+        vision_lora_enabled: bool = False,  # Track if vision encoder uses LoRA
+        stage1_checkpoint_provided: bool = False  # For auto-detect freeze logic
     ):
         super().__init__()
         
@@ -123,11 +146,19 @@ class ReportGenLightning(pl.LightningModule):
             NUM_PROJECTION_QUERIES, PROJECTION_LAYERS, PROJECTION_DROPOUT,
             LEARNING_RATE_STAGE2, WARMUP_STEPS_STAGE2, LABEL_SMOOTHING
         )
+        from utils.logger import setup_logger
+        logger = setup_logger(__name__)
         
         # Apply defaults from config
         num_queries = num_queries or NUM_PROJECTION_QUERIES
         learning_rate = learning_rate or LEARNING_RATE_STAGE2
         warmup_steps = warmup_steps or WARMUP_STEPS_STAGE2
+        
+        # === Smart freeze logic ===
+        # Auto-detect: unfreeze if no Stage 1 checkpoint provided
+        if freeze_vision is None:
+            freeze_vision = stage1_checkpoint_provided
+            logger.info(f"Auto freeze_vision={freeze_vision} (stage1_provided={stage1_checkpoint_provided})")
         
         self.save_hyperparameters()
         
@@ -138,11 +169,31 @@ class ReportGenLightning(pl.LightningModule):
         if vision_lora_enabled:
             lora_config_vision = get_lora_config(model_type="vision")
             self.vision_encoder.model = apply_lora(self.vision_encoder.model, lora_config_vision)
+            logger.info("Vision LoRA adapters applied")
         
+        # === Freeze logic with LoRA-aware eval() handling ===
         if freeze_vision:
-            for p in self.vision_encoder.parameters():
-                p.requires_grad = False
-            self.vision_encoder.eval()
+            # Freeze base but keep LoRA trainable
+            for name, param in self.vision_encoder.named_parameters():
+                if 'lora_' in name.lower():
+                    param.requires_grad = True  # LoRA stays trainable
+                else:
+                    param.requires_grad = False
+            
+            # CRITICAL: Do NOT call eval() if LoRA enabled!
+            # eval() disables dropout in LoRA layers, hurting training.
+            if not vision_lora_enabled:
+                self.vision_encoder.eval()
+                logger.info("Vision encoder: fully frozen (eval mode)")
+            else:
+                # Keep in train mode for LoRA dropout to work
+                logger.info("Vision encoder: base frozen, LoRA trainable (train mode for dropout)")
+        else:
+            # Full training mode
+            for param in self.vision_encoder.parameters():
+                param.requires_grad = True
+            self.vision_encoder.train()
+            logger.info("Vision encoder: fully trainable")
             
         # 2. Perceiver Resampler (OPTIMIZED from config)
         self.perceiver = PerceiverResampler(
@@ -159,6 +210,12 @@ class ReportGenLightning(pl.LightningModule):
         # Apply LoRA to BioGPT with HIGHER RANK for LLM
         lora_config = get_lora_config(model_type="llm")  # Uses r=64, alpha=128
         self.biogpt.model = apply_lora(self.biogpt.model, lora_config)
+        
+        # === Enable gradient checkpointing for BioGPT (VRAM optimization) ===
+        # Only for BioGPT - NOT for vision encoder (it's frozen, checkpointing adds overhead)
+        if hasattr(self.biogpt.model, 'gradient_checkpointing_enable'):
+            self.biogpt.model.gradient_checkpointing_enable()
+            logger.info("BioGPT gradient checkpointing enabled (~30-40% VRAM reduction)")
         
         self.tokenizer = self.biogpt.tokenizer
         self.label_smoothing = LABEL_SMOOTHING  # 0.1
@@ -197,6 +254,25 @@ class ReportGenLightning(pl.LightningModule):
         outputs = self(pixel_values, input_ids, attention_mask, view_mask, labels, view_positions)
         loss = outputs.loss
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        
+        # === Perceiver gradient verification (every 100 steps) ===
+        if batch_idx % 100 == 0 and batch_idx > 0:
+            grad_norm = 0.0
+            grad_count = 0
+            for name, param in self.perceiver.named_parameters():
+                if param.grad is not None:
+                    grad_norm += param.grad.norm().item() ** 2
+                    grad_count += 1
+            
+            if grad_count > 0:
+                grad_norm = grad_norm ** 0.5
+                self.log('perceiver_grad_norm', grad_norm, on_step=True, prog_bar=False)
+                if grad_norm < 1e-7:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"Step {self.trainer.global_step}: Perceiver gradients near zero!"
+                    )
+        
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -259,8 +335,25 @@ class ReportGenLightning(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
+        # === Weight decay exclusion for LayerNorm and bias (stability improvement) ===
+        # Patterns to catch: BioGPT's "layer_norm", Perceiver's ".norm.", and all biases
+        no_decay = ["bias", "LayerNorm", "layer_norm", ".norm."]
+        
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in self.named_parameters() 
+                          if p.requires_grad and not any(nd in n for nd in no_decay)],
+                "weight_decay": 0.01,
+            },
+            {
+                "params": [p for n, p in self.named_parameters() 
+                          if p.requires_grad and any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+            },
+        ]
+        
         optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, self.parameters()), 
+            optimizer_grouped_parameters,
             lr=self.hparams.learning_rate
         )
         scheduler = get_linear_schedule_with_warmup(

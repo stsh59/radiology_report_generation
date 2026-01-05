@@ -91,6 +91,25 @@ def main(args):
     trainer.fit(model, datamodule=dm)
     
     logger.info(f"Training complete. Best model path: {checkpoint_callback.best_model_path}")
+    
+    # === Merge LoRA for Stage 2 transfer ===
+    # QLoRA quantized weights have different shapes than fp16.
+    # Merging produces full fp16 weights that Stage 2 can load cleanly.
+    logger.info("Merging LoRA adapters into base model for Stage 2 transfer...")
+    try:
+        merged_model = model.model.merge_and_unload()
+        
+        merged_checkpoint_path = CHECKPOINT_DIR / "stage1_contrastive" / "merged_for_stage2.pt"
+        torch.save({
+            'state_dict': merged_model.state_dict(),
+            'hparams': dict(model.hparams),
+            'merged': True,
+        }, merged_checkpoint_path)
+        logger.info(f"Saved merged checkpoint to {merged_checkpoint_path}")
+        logger.info("Use this checkpoint for Stage 2 to preserve visual adaptations.")
+    except Exception as e:
+        logger.warning(f"Could not merge LoRA: {e}")
+        logger.warning("Stage 2 may not receive full Stage 1 learning.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

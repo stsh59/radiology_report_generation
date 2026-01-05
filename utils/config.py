@@ -38,7 +38,7 @@ LEARNING_RATE_STAGE1 = 1e-4
 LEARNING_RATE_STAGE2 = 2e-5  # Lower for better generation quality
 
 NUM_EPOCHS_STAGE1 = 20
-NUM_EPOCHS_STAGE2 = 20  # Early stopping handles convergence
+NUM_EPOCHS_STAGE2 = 35  # More epochs for complex generation; early stopping handles convergence
 
 WARMUP_STEPS_STAGE1 = 1500  # Increased for stable LoRA adaptation with quantization
 WARMUP_STEPS_STAGE2 = 750  # Balanced warmup for faster convergence
@@ -80,8 +80,8 @@ GENERATION_EARLY_STOPPING = True
 # Label smoothing
 LABEL_SMOOTHING = 0.1
 
-# Early stopping
-EARLY_STOPPING_PATIENCE = 3
+# Early stopping (5 for generative tasks - loss can plateau before improving)
+EARLY_STOPPING_PATIENCE = 5
 
 # Data split ratios
 TRAIN_RATIO = 0.7

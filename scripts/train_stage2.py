@@ -64,25 +64,55 @@ def main(args):
     # Detect LoRA in Stage 1 checkpoint BEFORE model creation (for proper hparam saving)
     stage1_has_lora = False
     stage1_state = None
+    stage1_checkpoint_provided = args.stage1_checkpoint is not None
+    
     if args.stage1_checkpoint:
+        checkpoint_path = Path(args.stage1_checkpoint)
+        
+        # === Check for merged checkpoint (preferred for clean weight transfer) ===
+        merged_checkpoint = checkpoint_path.parent / "merged_for_stage2.pt"
+        if merged_checkpoint.exists() and checkpoint_path != merged_checkpoint:
+            logger.info(f"Found merged checkpoint: {merged_checkpoint}")
+            logger.info("Using merged checkpoint for clean weight transfer (no shape mismatches)")
+            args.stage1_checkpoint = str(merged_checkpoint)
+            checkpoint_path = merged_checkpoint
+        
         logger.info(f"Pre-loading Stage 1 checkpoint to detect LoRA: {args.stage1_checkpoint}")
         stage1_state = torch.load(args.stage1_checkpoint, map_location=DEVICE)
+        
+        # Check if this is a merged checkpoint
+        is_merged = stage1_state.get('merged', False) if isinstance(stage1_state, dict) else False
+        
         if 'state_dict' in stage1_state:
             stage1_state = stage1_state['state_dict']
-        stage1_has_lora = any(("lora_" in k) or ("lora_A" in k) or ("lora_B" in k) for k in stage1_state.keys())
-        if stage1_has_lora:
-            logger.info("Stage 1 checkpoint contains LoRA adapter weights. Will create model with vision_lora_enabled=True.")
+        
+        if is_merged:
+            logger.info("Checkpoint is already merged - clean transfer possible (no LoRA architecture needed)")
+            stage1_has_lora = False
+        else:
+            stage1_has_lora = any(("lora_" in k) or ("lora_A" in k) or ("lora_B" in k) for k in stage1_state.keys())
+            if stage1_has_lora:
+                logger.info("Stage 1 checkpoint contains LoRA adapter weights. Will create model with vision_lora_enabled=True.")
     
     # Model (uses config defaults for LR, warmup, Perceiver)
     # Pass vision_lora_enabled=True if Stage 1 has LoRA (this saves to hparams for checkpoint loading)
+    # freeze_vision=None enables auto-detect: freeze if stage1 provided, else unfreeze
     logger.info("Initializing Model (ReportGen)...")
+    
+    # Determine freeze_vision: explicit flag takes precedence, otherwise auto-detect
+    if args.unfreeze_vision:
+        freeze_vision = False
+    else:
+        freeze_vision = None  # Auto-detect based on stage1_checkpoint_provided
+    
     model = ReportGenLightning(
         siglip_model_name=SIGLIP_MODEL_NAME,
         biogpt_model_name=BIOGPT_MODEL_NAME,
         learning_rate=args.lr,
         warmup_steps=WARMUP_STEPS_STAGE2,
-        freeze_vision=not args.unfreeze_vision,
-        vision_lora_enabled=stage1_has_lora
+        freeze_vision=freeze_vision,
+        vision_lora_enabled=stage1_has_lora,
+        stage1_checkpoint_provided=stage1_checkpoint_provided
     )
     
     # Load Stage 1 checkpoint weights if provided

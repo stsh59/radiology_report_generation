@@ -53,12 +53,14 @@ class MultiViewDataset(Dataset):
         if transform is not None:
             self.transform = transform
         elif self.is_train:
+            # Medical-safe augmentation: NO horizontal flip (inverts L/R anatomy)
             self.transform = transforms.Compose([
                 transforms.Resize((256, 256)),  # Larger for random crop
                 transforms.RandomCrop((IMAGE_SIZE, IMAGE_SIZE)),
-                transforms.RandomHorizontalFlip(p=0.5),  # Anatomically valid for X-rays
-                transforms.RandomRotation(degrees=10),   # Small rotations
-                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                # RandomHorizontalFlip REMOVED - anatomically invalid for chest X-rays
+                # (left lung becomes right, cardiac position inverts)
+                transforms.RandomRotation(degrees=10),   # Small rotations - safe
+                transforms.ColorJitter(brightness=0.2, contrast=0.2),  # Safe
                 transforms.ToTensor(),
                 transforms.Normalize(mean=IMAGE_MEAN, std=IMAGE_STD)
             ])

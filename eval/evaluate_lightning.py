@@ -114,7 +114,7 @@ def evaluate_model(checkpoint_path: str, split: str = 'test', output_dir: Path =
         batch_size=8,
         num_workers=4,
         max_views=3,
-        max_length=256,
+        max_length=MAX_GENERATION_LENGTH,  # Match generation length (512) for accurate metrics
         image_root=str(IMAGES_DIR_MIMIC)
     )
     datamodule.setup(stage='test')
