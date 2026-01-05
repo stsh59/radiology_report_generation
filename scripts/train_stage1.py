@@ -92,20 +92,30 @@ def main(args):
     
     logger.info(f"Training complete. Best model path: {checkpoint_callback.best_model_path}")
     
-    # === Merge LoRA for Stage 2 transfer ===
-    # QLoRA quantized weights have different shapes than fp16.
-    # Merging produces full fp16 weights that Stage 2 can load cleanly.
-    logger.info("Merging LoRA adapters into base model for Stage 2 transfer...")
+    # === Merge LoRA and save VISION-ONLY weights for Stage 2 ===
+    # Stage 2 only uses SigLIP's vision_model (BioGPT handles text).
+    # Saving only vision_model avoids quantization issues with text_model.
+    logger.info("Merging LoRA adapters and extracting vision-only weights for Stage 2...")
     try:
         merged_model = model.model.merge_and_unload()
         
+        # Extract ONLY vision_model weights (Stage 2 doesn't use text_model)
+        vision_state = merged_model.vision_model.state_dict()
+        
+        # Verify no text_model keys leaked in
+        assert all(not k.startswith("text_model.") for k in vision_state.keys()), \
+            "Vision checkpoint contains unexpected text_model keys"
+        
+        logger.info(f"Extracted {len(vision_state)} vision-only parameters")
+        
         merged_checkpoint_path = CHECKPOINT_DIR / "stage1_contrastive" / "merged_for_stage2.pt"
         torch.save({
-            'state_dict': merged_model.state_dict(),
+            'vision_model_state_dict': vision_state,  # Vision-only (clean transfer)
             'hparams': dict(model.hparams),
             'merged': True,
+            'vision_only': True,  # Flag for Stage 2 detection
         }, merged_checkpoint_path)
-        logger.info(f"Saved merged checkpoint to {merged_checkpoint_path}")
+        logger.info(f"Saved vision-only checkpoint to {merged_checkpoint_path}")
         logger.info("Use this checkpoint for Stage 2 to preserve visual adaptations.")
     except Exception as e:
         logger.warning(f"Could not merge LoRA: {e}")

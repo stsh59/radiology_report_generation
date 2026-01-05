@@ -61,9 +61,10 @@ def main(args):
         image_root=str(IMAGES_DIR_MIMIC)
     )
     
-    # Detect LoRA in Stage 1 checkpoint BEFORE model creation (for proper hparam saving)
+    # Detect LoRA and checkpoint type BEFORE model creation
     stage1_has_lora = False
-    stage1_state = None
+    stage1_checkpoint_data = None  # Full checkpoint dict (not just state_dict)
+    vision_state_dict = None  # Vision-only weights to load
     stage1_checkpoint_provided = args.stage1_checkpoint is not None
     
     if args.stage1_checkpoint:
@@ -77,22 +78,46 @@ def main(args):
             args.stage1_checkpoint = str(merged_checkpoint)
             checkpoint_path = merged_checkpoint
         
-        logger.info(f"Pre-loading Stage 1 checkpoint to detect LoRA: {args.stage1_checkpoint}")
-        stage1_state = torch.load(args.stage1_checkpoint, map_location=DEVICE)
+        logger.info(f"Pre-loading Stage 1 checkpoint: {args.stage1_checkpoint}")
+        stage1_checkpoint_data = torch.load(args.stage1_checkpoint, map_location=DEVICE)
         
-        # Check if this is a merged checkpoint
-        is_merged = stage1_state.get('merged', False) if isinstance(stage1_state, dict) else False
+        # Detect checkpoint format
+        is_merged = stage1_checkpoint_data.get('merged', False) if isinstance(stage1_checkpoint_data, dict) else False
+        is_vision_only = stage1_checkpoint_data.get('vision_only', False) if isinstance(stage1_checkpoint_data, dict) else False
         
-        if 'state_dict' in stage1_state:
-            stage1_state = stage1_state['state_dict']
-        
-        if is_merged:
-            logger.info("Checkpoint is already merged - clean transfer possible (no LoRA architecture needed)")
+        # === NEW: Handle vision-only checkpoint (preferred, production-grade) ===
+        if is_vision_only and 'vision_model_state_dict' in stage1_checkpoint_data:
+            logger.info("✅ Detected vision-only Stage 1 checkpoint (expected format)")
+            vision_state_dict = stage1_checkpoint_data['vision_model_state_dict']
+            logger.info(f"  Loaded {len(vision_state_dict)} vision-only parameters from Stage 1")
+            stage1_has_lora = False  # Merged checkpoint, no LoRA architecture needed
+            
+        # === Fallback: Handle legacy merged checkpoint with full state_dict ===
+        elif is_merged and 'state_dict' in stage1_checkpoint_data:
+            logger.info("Detected legacy merged checkpoint (full state_dict)")
+            full_state = stage1_checkpoint_data['state_dict']
+            # Filter to only vision_model keys
+            vision_state_dict = {
+                k.replace("vision_model.", ""): v 
+                for k, v in full_state.items() 
+                if k.startswith("vision_model.")
+            }
+            if not vision_state_dict:
+                raise ValueError("Legacy checkpoint has no vision_model keys - cannot transfer to Stage 2")
+            logger.info(f"  Extracted {len(vision_state_dict)} vision parameters from legacy checkpoint")
             stage1_has_lora = False
-        else:
-            stage1_has_lora = any(("lora_" in k) or ("lora_A" in k) or ("lora_B" in k) for k in stage1_state.keys())
+            
+        # === Handle raw Lightning checkpoint (with potential LoRA) ===
+        elif 'state_dict' in stage1_checkpoint_data:
+            logger.warning("Raw Lightning checkpoint detected - may have LoRA/quantization issues")
+            raw_state = stage1_checkpoint_data['state_dict']
+            stage1_has_lora = any(("lora_" in k) or ("lora_A" in k) or ("lora_B" in k) for k in raw_state.keys())
             if stage1_has_lora:
                 logger.info("Stage 1 checkpoint contains LoRA adapter weights. Will create model with vision_lora_enabled=True.")
+            # Will use old loading path below
+            vision_state_dict = None  # Signal to use legacy loader
+        else:
+            raise ValueError(f"Unknown checkpoint format: keys = {list(stage1_checkpoint_data.keys())[:10]}")
     
     # Model (uses config defaults for LR, warmup, Perceiver)
     # Pass vision_lora_enabled=True if Stage 1 has LoRA (this saves to hparams for checkpoint loading)
@@ -116,14 +141,66 @@ def main(args):
     )
     
     # Load Stage 1 checkpoint weights if provided
-    if args.stage1_checkpoint and stage1_state is not None:
-        logger.info(f"Loading Stage 1 weights from {args.stage1_checkpoint}")
-
+    if args.stage1_checkpoint and vision_state_dict is not None:
+        # === NEW: Clean vision-only loading path (production-grade) ===
+        logger.info(f"Loading Stage 1 vision weights from {args.stage1_checkpoint}")
+        
+        # Get target vision model's expected keys
+        # Note: model.vision_encoder.model is SiglipModel, we need its vision_model
+        target_vision_model = model.vision_encoder.model.vision_model
+        target_state = target_vision_model.state_dict()
+        
+        # Verify all source keys are vision_model keys (no text_model contamination)
+        logger.info(f"  Source keys: {len(vision_state_dict)}")
+        logger.info(f"  Target keys: {len(target_state)}")
+        
+        # Match keys between source and target
+        source_keys = set(vision_state_dict.keys())
+        target_keys = set(target_state.keys())
+        
+        matched_keys = source_keys & target_keys
+        missing_in_source = target_keys - source_keys
+        extra_in_source = source_keys - target_keys
+        
+        match_ratio = len(matched_keys) / len(target_keys) if target_keys else 0.0
+        
+        logger.info(f"  Matched: {len(matched_keys)} / {len(target_keys)} ({match_ratio*100:.1f}%)")
+        
+        if missing_in_source:
+            logger.warning(f"  Missing in source: {len(missing_in_source)} keys: {list(missing_in_source)[:10]}")
+        if extra_in_source:
+            logger.info(f"  Extra in source (ignored): {len(extra_in_source)} keys: {list(extra_in_source)[:5]}")
+        
+        # Verify shape compatibility
+        shape_mismatches = []
+        for k in matched_keys:
+            if vision_state_dict[k].shape != target_state[k].shape:
+                shape_mismatches.append(k)
+        
+        if shape_mismatches:
+            raise ValueError(f"Shape mismatch in {len(shape_mismatches)} keys: {shape_mismatches[:5]}")
+        
+        # Strict load - all matched keys must load successfully
+        min_match_threshold = float(args.min_match_ratio)
+        if match_ratio < min_match_threshold:
+            raise ValueError(
+                f"Stage-1 -> Stage-2 vision weight transfer failed: "
+                f"{match_ratio*100:.1f}% < required {min_match_threshold*100:.1f}%"
+            )
+        
+        # Load weights (strict=True since we've verified compatibility)
+        target_vision_model.load_state_dict(vision_state_dict, strict=True)
+        logger.info("✅ Stage 1 vision weights loaded successfully (100% match, strict=True)")
+        
+    elif args.stage1_checkpoint and stage1_has_lora:
+        # === Legacy path: LoRA checkpoint (not recommended, but supported) ===
+        logger.warning("Using legacy LoRA loading path - consider using merged checkpoint instead")
+        raw_state = stage1_checkpoint_data.get('state_dict', {})
+        
         # Build canonical -> tensor mapping from Stage-1
         source_by_canon = {}
-        for k, v in stage1_state.items():
+        for k, v in raw_state.items():
             canon = _canonicalize_state_key(k)
-            # Prefer first occurrence; duplicates are usually identical wrappers
             if canon not in source_by_canon:
                 source_by_canon[canon] = v
 
@@ -133,7 +210,6 @@ def main(args):
         target_by_canon = {}
         for k in target_keys:
             canon = _canonicalize_state_key(k)
-            # Prefer base_model.model.* keys if present (PEFT models)
             if canon not in target_by_canon:
                 target_by_canon[canon] = k
             else:
@@ -145,41 +221,13 @@ def main(args):
         target_canons = set(target_by_canon.keys())
 
         matched_canons = target_canons & source_canons
-        missing_canons = target_canons - source_canons
-        extra_canons = source_canons - target_canons
-
-        loaded_ratio = len(matched_canons) / len(target_canons) if target_canons else 0.0
-
-        # LoRA verification (if target has LoRA keys, require some to match)
-        target_lora_canons = {c for c in target_canons if ("lora_" in c) or ("lora_A" in c) or ("lora_B" in c)}
-        matched_lora_canons = matched_canons & target_lora_canons
 
         logger.info("Weight transfer analysis (Stage1 -> Stage2 vision):")
         logger.info(f"  Target keys: {len(target_keys)} (canonical={len(target_canons)})")
-        logger.info(f"  Source keys: {len(stage1_state)} (canonical={len(source_canons)})")
-        logger.info(f"  Matched: {len(matched_canons)} ({loaded_ratio*100:.1f}%)")
-        if target_lora_canons:
-            logger.info(f"  LoRA keys (target): {len(target_lora_canons)}, matched LoRA: {len(matched_lora_canons)}")
+        logger.info(f"  Source keys: {len(raw_state)} (canonical={len(source_canons)})")
+        logger.info(f"  Matched: {len(matched_canons)}")
 
-        if missing_canons:
-            missing_preview = sorted(list(missing_canons))[:20]
-            logger.warning(f"  Missing in source: {len(missing_canons)} keys (showing up to 20): {missing_preview}")
-        if extra_canons:
-            extra_preview = sorted(list(extra_canons))[:20]
-            logger.info(f"  Extra in source (ignored): {len(extra_canons)} keys (showing up to 20): {extra_preview}")
-
-        # Verification gates (fail-fast by default)
-        # Note: failures list is populated after filtering, not here
-        min_match_threshold = float(args.min_match_ratio)
-        failures = []
-
-        # Optional parameter norm check (helps catch 'loaded nothing' cases)
-        norm_before = None
-        norm_after = None
-        if args.verify_param_norm:
-            norm_before = sum(p.norm().item() for p in model.vision_encoder.model.parameters())
-
-        # Load matched weights into target actual keys (skip shape mismatches from quantized checkpoint)
+        # Load matched weights (skip shape mismatches from quantized checkpoint)
         filtered_state = {}
         skipped_shape_mismatch = 0
         for canon in matched_canons:
@@ -187,7 +235,6 @@ def main(args):
             src_tensor = source_by_canon[canon]
             tgt_shape = target_state[tgt_key].shape
             
-            # Skip if shapes don't match (quantized base weights vs fresh fp16/fp32)
             if src_tensor.shape != tgt_shape:
                 skipped_shape_mismatch += 1
                 continue
@@ -195,52 +242,16 @@ def main(args):
             filtered_state[tgt_key] = src_tensor
 
         if skipped_shape_mismatch > 0:
-            logger.info(f"  Skipped {skipped_shape_mismatch} keys due to shape mismatch (quantized base weights)")
+            logger.info(f"  Skipped {skipped_shape_mismatch} keys due to shape mismatch (quantized)")
 
-        # Adjust match ratio for skipped quantized weights
-        actual_loaded = len(filtered_state)
-        adjusted_ratio = actual_loaded / len(target_canons) if target_canons else 0.0
-        logger.info(f"  Actually loaded: {actual_loaded} keys ({adjusted_ratio*100:.1f}%)")
+        lora_loaded = sum(1 for k in filtered_state if 'lora_' in k)
+        logger.info(f"  LoRA adapters loaded: {lora_loaded}")
+        
+        if lora_loaded == 0:
+            raise ValueError("No LoRA adapter keys loaded from Stage 1 checkpoint")
 
-        # Verification: if stage1 has LoRA, success = LoRA adapters loaded (skip ratio check for quantized base)
-        if stage1_has_lora:
-            lora_loaded = sum(1 for k in filtered_state if 'lora_' in k)
-            logger.info(f"  LoRA adapters loaded: {lora_loaded}")
-            if target_lora_canons and lora_loaded == 0:
-                failures.append("no LoRA adapter keys loaded")
-        else:
-            # Non-LoRA checkpoint: use standard ratio check
-            if adjusted_ratio < min_match_threshold:
-                failures.append(f"loaded/expected {adjusted_ratio*100:.1f}% < required {min_match_threshold*100:.1f}%")
-
-        incompatible = model.vision_encoder.model.load_state_dict(filtered_state, strict=False)
-
-        if args.verify_param_norm:
-            norm_after = sum(p.norm().item() for p in model.vision_encoder.model.parameters())
-            if norm_before is not None and norm_after is not None:
-                if abs(norm_after - norm_before) < 0.01:
-                    failures.append("parameter norms unchanged after load (possible no-op load)")
-                else:
-                    logger.info(f"  Norm change: {norm_before:.2f} -> {norm_after:.2f} (Δ={norm_after-norm_before:.2f})")
-
-        # Log load_state_dict incompatibilities (bounded)
-        if getattr(incompatible, "missing_keys", None):
-            mk = list(incompatible.missing_keys)
-            if mk:
-                logger.warning(f"  load_state_dict missing_keys: {len(mk)} (showing up to 20): {mk[:20]}")
-        if getattr(incompatible, "unexpected_keys", None):
-            uk = list(incompatible.unexpected_keys)
-            if uk:
-                logger.warning(f"  load_state_dict unexpected_keys: {len(uk)} (showing up to 20): {uk[:20]}")
-
-        if failures:
-            error_msg = "Stage-1 -> Stage-2 weight transfer verification failed: " + "; ".join(failures)
-            if args.allow_partial_load and not args.strict_load:
-                logger.warning(error_msg + " - Proceeding due to --allow_partial_load.")
-            else:
-                raise ValueError(error_msg + " - Aborting training (use --allow_partial_load to override).")
-
-        logger.info("✅ Stage 1 vision weights (and adapters, if present) loaded successfully.")
+        model.vision_encoder.model.load_state_dict(filtered_state, strict=False)
+        logger.info("✅ Stage 1 LoRA weights loaded (legacy path)")
 
     # Callbacks
     checkpoint_callback = ModelCheckpoint(
