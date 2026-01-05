@@ -40,7 +40,7 @@ class MedicalSigLIPLightning(pl.LightningModule):
         weight_decay: float = 0.01,
         warmup_steps: int = 500,
         temperature: float = 0.07,
-        use_qlora: bool = True
+        use_qlora: bool = False  # Changed from True - fp16 weights transfer cleanly to Stage 2
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -56,13 +56,10 @@ class MedicalSigLIPLightning(pl.LightningModule):
             )
             self.model = apply_qlora(self.model, lora_config)
         else:
-            # Fallback to standard LoRA or full finetuning (here LoRA)
+            # Standard LoRA without quantization (fp16 base weights)
             from models.peft_config import get_lora_config, apply_lora
             self.model = AutoModel.from_pretrained(model_name)
-            lora_config = get_lora_config(r=16, lora_alpha=32, target_modules=["query", "key", "value", "out_proj"]) 
-            # Note: SigLIP modules might differ, using generic attention names or safely finding them?
-            # SigLIP uses q_proj, k_proj, v_proj usually.
-            # Let's trust peft_config default or set reasonable ones. 
+            lora_config = get_lora_config(model_type="vision")  # Uses config: q_proj, k_proj, v_proj, out_proj
             self.model = apply_lora(self.model, lora_config)
         
         # Processor for validation text encoding (if needed outside tokens)

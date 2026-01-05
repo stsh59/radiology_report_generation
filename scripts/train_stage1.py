@@ -52,7 +52,8 @@ def main(args):
         learning_rate=args.lr,
         weight_decay=WEIGHT_DECAY,
         warmup_steps=WARMUP_STEPS_STAGE1,
-        temperature=TEMPERATURE_STAGE1
+        temperature=TEMPERATURE_STAGE1,
+        use_qlora=args.use_qlora
     )
     
     # Callbacks
@@ -126,6 +127,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE_STAGE1)
     parser.add_argument("--epochs", type=int, default=NUM_EPOCHS_STAGE1)
     parser.add_argument("--lr", type=float, default=LEARNING_RATE_STAGE1)
+    parser.add_argument("--use_qlora", action="store_true", 
+                        help="Use 4-bit quantization (not recommended - breaks Stage 2 transfer)")
     args = parser.parse_args()
     
     main(args)
