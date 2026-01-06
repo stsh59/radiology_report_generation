@@ -124,7 +124,25 @@ class BioGPTGenerator(torch.nn.Module):
         # Only positions after that contain actual generated token IDs
         generated_ids = outputs[:, input_length:]
         
-        return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        decoded = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        
+        # === Post-processing: Case-insensitive sentence deduplication ===
+        # Handles repetition that bypasses ngram check due to case variations
+        def dedupe_sentences(text):
+            sentences = text.replace('. ', '.|').replace('? ', '?|').replace('! ', '!|').split('|')
+            seen = set()
+            result = []
+            for s in sentences:
+                s = s.strip()
+                if not s:
+                    continue
+                key = s.lower()
+                if key not in seen:
+                    seen.add(key)
+                    result.append(s)
+            return ' '.join(result)
+        
+        return [dedupe_sentences(text) for text in decoded]
 
 class ReportGenLightning(pl.LightningModule):
     def __init__(
@@ -155,10 +173,11 @@ class ReportGenLightning(pl.LightningModule):
         warmup_steps = warmup_steps or WARMUP_STEPS_STAGE2
         
         # === Smart freeze logic ===
-        # Auto-detect: unfreeze if no Stage 1 checkpoint provided
+        # Changed: Default to UNFROZEN for better vision-language alignment
+        # Vision encoder trains with very low LR (1e-6) to preserve Stage 1 learning
         if freeze_vision is None:
-            freeze_vision = stage1_checkpoint_provided
-            logger.info(f"Auto freeze_vision={freeze_vision} (stage1_provided={stage1_checkpoint_provided})")
+            freeze_vision = False  # Always unfreeze for better results
+            logger.info(f"Auto freeze_vision={freeze_vision} (unfrozen for fine-tuning with low LR)")
         
         self.save_hyperparameters()
         
@@ -335,27 +354,57 @@ class ReportGenLightning(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        # === Weight decay exclusion for LayerNorm and bias (stability improvement) ===
-        # Patterns to catch: BioGPT's "layer_norm", Perceiver's ".norm.", and all biases
+        # === Layer-wise Learning Rates (Critical for vision-language bridge) ===
+        from utils.config import LEARNING_RATE_VISION, LEARNING_RATE_PERCEIVER, LEARNING_RATE_BIOGPT
+        
         no_decay = ["bias", "LayerNorm", "layer_norm", ".norm."]
         
+        # Separate parameter groups by component with different LRs
+        vision_params_decay = []
+        vision_params_no_decay = []
+        perceiver_params_decay = []
+        perceiver_params_no_decay = []
+        biogpt_params_decay = []
+        biogpt_params_no_decay = []
+        
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            
+            is_no_decay = any(nd in name for nd in no_decay)
+            
+            if name.startswith("vision_encoder"):
+                if is_no_decay:
+                    vision_params_no_decay.append(param)
+                else:
+                    vision_params_decay.append(param)
+            elif name.startswith("perceiver"):
+                if is_no_decay:
+                    perceiver_params_no_decay.append(param)
+                else:
+                    perceiver_params_decay.append(param)
+            else:  # biogpt
+                if is_no_decay:
+                    biogpt_params_no_decay.append(param)
+                else:
+                    biogpt_params_decay.append(param)
+        
         optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in self.named_parameters() 
-                          if p.requires_grad and not any(nd in n for nd in no_decay)],
-                "weight_decay": 0.01,
-            },
-            {
-                "params": [p for n, p in self.named_parameters() 
-                          if p.requires_grad and any(nd in n for nd in no_decay)],
-                "weight_decay": 0.0,
-            },
+            # Vision encoder (very low LR to preserve Stage 1 learning)
+            {"params": vision_params_decay, "lr": LEARNING_RATE_VISION, "weight_decay": 0.01},
+            {"params": vision_params_no_decay, "lr": LEARNING_RATE_VISION, "weight_decay": 0.0},
+            # Perceiver (high LR to ensure gradient flow through bridge)
+            {"params": perceiver_params_decay, "lr": LEARNING_RATE_PERCEIVER, "weight_decay": 0.01},
+            {"params": perceiver_params_no_decay, "lr": LEARNING_RATE_PERCEIVER, "weight_decay": 0.0},
+            # BioGPT (standard LR)
+            {"params": biogpt_params_decay, "lr": LEARNING_RATE_BIOGPT, "weight_decay": 0.01},
+            {"params": biogpt_params_no_decay, "lr": LEARNING_RATE_BIOGPT, "weight_decay": 0.0},
         ]
         
-        optimizer = torch.optim.AdamW(
-            optimizer_grouped_parameters,
-            lr=self.hparams.learning_rate
-        )
+        # Filter out empty groups
+        optimizer_grouped_parameters = [g for g in optimizer_grouped_parameters if len(g["params"]) > 0]
+        
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
         scheduler = get_linear_schedule_with_warmup(
             optimizer, 
             num_warmup_steps=self.hparams.warmup_steps, 

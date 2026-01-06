@@ -132,12 +132,16 @@ class PerceiverResampler(nn.Module):
             # If our mask is 1=Valid, 0=Pad:
             key_padding_mask = (extended_mask == 0)
 
-        # Apply Transformer
-        output = self.transformer(
+        # Apply Transformer with residual connection for gradient flow
+        transformer_out = self.transformer(
             tgt, 
             memory, 
             memory_key_padding_mask=key_padding_mask
         )
+        
+        # Residual connection: helps gradients flow through the bridge
+        # This prevents the "Perceiver gradients near zero" issue
+        output = tgt + transformer_out
         
         output = self.norm(self.out_proj(output))
         
