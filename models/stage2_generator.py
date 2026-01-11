@@ -3,7 +3,7 @@ from typing import Dict, List, Tuple
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-from peft import PeftModel
+from peft import PeftModel, LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, SiglipVisionModel
 
 from models.perceiver_resampler import PerceiverResampler
@@ -84,7 +84,17 @@ class Stage2GeneratorModel(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         base_vision = SiglipVisionModel.from_pretrained(model_name)
-        self.image_encoder: SiglipVisionModel = PeftModel.from_pretrained(base_vision, lora_path)
+        lora_cfg = LoraConfig(
+            inference_mode=False,
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.0,
+            target_modules=["q_proj", "k_proj", "v_proj"],
+        )
+        vision_peft = get_peft_model(base_vision, lora_cfg)
+        vision_peft.load_adapter(lora_path, adapter_name="default", is_trainable=False)
+        vision_peft.set_adapter("default")
+        self.image_encoder: SiglipVisionModel = vision_peft
         for p in self.image_encoder.parameters():
             p.requires_grad = False
 

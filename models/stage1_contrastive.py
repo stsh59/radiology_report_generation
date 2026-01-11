@@ -23,7 +23,6 @@ class Stage1ContrastiveModel(pl.LightningModule):
         self.processor = SiglipProcessor.from_pretrained(model_name)
 
         lora_cfg = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION,
             inference_mode=False,
             r=16,
             lora_alpha=32,
