@@ -34,23 +34,13 @@ class Stage1ContrastiveModel(pl.LightningModule):
         self.vision_model: SiglipVisionModel = get_peft_model(base_model.vision_model, lora_cfg)
         self.text_model: SiglipTextModel = get_peft_model(base_model.text_model, lora_cfg)
 
-        if hasattr(base_model, "visual_projection"):
-            self.visual_projection = base_model.visual_projection
-        else:
-            self.visual_projection = nn.Linear(
-                base_model.config.vision_config.hidden_size,
-                base_model.config.projection_dim,
-                bias=False,
-            )
+        vision_hidden = base_model.config.vision_config.hidden_size
+        text_hidden = base_model.config.text_config.hidden_size
+        assert vision_hidden == text_hidden
+        proj_dim = vision_hidden
 
-        if hasattr(base_model, "text_projection"):
-            self.text_projection = base_model.text_projection
-        else:
-            self.text_projection = nn.Linear(
-                base_model.config.text_config.hidden_size,
-                base_model.config.projection_dim,
-                bias=False,
-            )
+        self.visual_projection = nn.Linear(vision_hidden, proj_dim, bias=False)
+        self.text_projection = nn.Linear(text_hidden, proj_dim, bias=False)
 
         for name, param in self.vision_model.named_parameters():
             if "lora_" not in name:
