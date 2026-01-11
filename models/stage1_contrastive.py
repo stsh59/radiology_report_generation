@@ -1,3 +1,4 @@
+import math
 from typing import Any, Dict, Tuple
 
 import torch
@@ -60,48 +61,56 @@ class Stage1ContrastiveModel(pl.LightningModule):
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
 
-        v_pa_tokens = self.vision_model(pixel_values=pixel_values_pa).last_hidden_state  # (b, seq, dim)
-        v_lat_tokens = self.vision_model(pixel_values=pixel_values_lat).last_hidden_state
-        v_pa_pooled = v_pa_tokens.mean(dim=1)
-        v_lat_pooled = v_lat_tokens.mean(dim=1)
-        v_pa = self.visual_projection(v_pa_pooled)
-        v_lat = self.visual_projection(v_lat_pooled)
+        v_pa_tokens = self.vision_model(pixel_values=pixel_values_pa).last_hidden_state  # (b, li, dv)
+        v_lat_tokens = self.vision_model(pixel_values=pixel_values_lat).last_hidden_state  # (b, li, dv)
+        v_pa_tokens = self.visual_projection(v_pa_tokens)  # (b, li, d)
+        v_lat_tokens = self.visual_projection(v_lat_tokens)  # (b, li, d)
 
         text_outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
-        text_tokens = text_outputs.last_hidden_state  # (b, seq, dim)
-        mask = attention_mask.unsqueeze(-1)
-        text_pooled = (text_tokens * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        t = self.text_projection(text_pooled)
+        text_tokens = text_outputs.last_hidden_state  # (b, lt, dt)
+        t_tokens = self.text_projection(text_tokens)  # (b, lt, d)
 
-        v_pa = F.normalize(v_pa, dim=-1)
-        v_lat = F.normalize(v_lat, dim=-1)
-        t = F.normalize(t, dim=-1)
-        return v_pa, v_lat, t
+        # L2 normalize per token
+        v_pa_tokens = F.normalize(v_pa_tokens, dim=-1)
+        v_lat_tokens = F.normalize(v_lat_tokens, dim=-1)
+        t_tokens = F.normalize(t_tokens, dim=-1)
+        # Mask out padded text tokens
+        t_mask = batch["attention_mask"].unsqueeze(-1)
+        t_tokens = t_tokens * t_mask
+        return v_pa_tokens, v_lat_tokens, t_tokens
 
-    def _compute_losses(self, v_pa: torch.Tensor, v_lat: torch.Tensor, t: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _compute_losses(
+        self, v_pa_tokens: torch.Tensor, v_lat_tokens: torch.Tensor, t_tokens: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
         tau = self.temperature
-        b = t.shape[0]
-
-        logits_pa_t = (v_pa @ t.T) / tau
-        logits_lat_t = (v_lat @ t.T) / tau
+        b, li, _ = v_pa_tokens.shape
         target = torch.arange(b, device=self.device)
 
+        # Image -> Text (PA, Lat) using token-level logsumexp aggregation
+        sim_pa_t = torch.einsum("bid,Bjd->bBij", v_pa_tokens, t_tokens) / tau  # (b, b, li, lt)
+        sim_pa_t = sim_pa_t.clamp(min=-50, max=50)
+        sim_lat_t = torch.einsum("bid,Bjd->bBij", v_lat_tokens, t_tokens) / tau
+        sim_lat_t = sim_lat_t.clamp(min=-50, max=50)
+        logits_pa_t = torch.logsumexp(sim_pa_t, dim=(2, 3))  # (b, b)
+        logits_lat_t = torch.logsumexp(sim_lat_t, dim=(2, 3))  # (b, b)
         loss_img_to_text = 0.5 * (
             F.cross_entropy(logits_pa_t, target) + F.cross_entropy(logits_lat_t, target)
         )
 
-        images = torch.cat([v_pa, v_lat], dim=0)  # (2b, d)
-        logits_t_img = (t @ images.T) / tau  # (b, 2b)
+        # Text -> Image (multi-positive: PA + Lateral)
+        images_tokens = torch.cat([v_pa_tokens, v_lat_tokens], dim=0)  # (2b, li, d)
+        sim_t_img = torch.einsum("bid,Bjd->bBij", t_tokens, images_tokens) / tau  # (b, 2b, lt, li)
+        sim_t_img = sim_t_img.clamp(min=-50, max=50)
+        logits_t_img = torch.logsumexp(sim_t_img, dim=(2, 3))  # (b, 2b)
         positives = torch.stack([target, target + b], dim=1)  # (b, 2)
         logits_max = torch.logsumexp(logits_t_img, dim=1)
-        pos_logits = torch.logsumexp(
-            torch.gather(logits_t_img, 1, positives),
-            dim=1,
-        )
+        pos_logits = torch.logsumexp(torch.gather(logits_t_img, 1, positives), dim=1)
         loss_text_to_img = -(pos_logits - logits_max).mean()
 
-        cosine_sim = F.cosine_similarity(v_pa, v_lat, dim=-1)
-        loss_img_img = (1 - cosine_sim).mean()
+        # Image–Image consistency (token-level cosine aggregated via log-mean-exp)
+        sim_pa_lat = torch.einsum("bid,bjd->bij", v_pa_tokens, v_lat_tokens)  # (b, li, li)
+        log_avg_sim = torch.logsumexp(sim_pa_lat, dim=(1, 2)) - math.log(li * li)
+        loss_img_img = (1 - log_avg_sim).mean()
 
         total_loss = loss_img_to_text + loss_text_to_img + self.lambda_img_img * loss_img_img
 
