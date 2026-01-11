@@ -2,6 +2,7 @@ import math
 from typing import Any, Dict, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
 import pytorch_lightning as pl
@@ -32,8 +33,24 @@ class Stage1ContrastiveModel(pl.LightningModule):
 
         self.vision_model: SiglipVisionModel = get_peft_model(base_model.vision_model, lora_cfg)
         self.text_model: SiglipTextModel = get_peft_model(base_model.text_model, lora_cfg)
-        self.visual_projection = base_model.visual_projection
-        self.text_projection = base_model.text_projection
+
+        if hasattr(base_model, "visual_projection"):
+            self.visual_projection = base_model.visual_projection
+        else:
+            self.visual_projection = nn.Linear(
+                base_model.config.vision_config.hidden_size,
+                base_model.config.projection_dim,
+                bias=False,
+            )
+
+        if hasattr(base_model, "text_projection"):
+            self.text_projection = base_model.text_projection
+        else:
+            self.text_projection = nn.Linear(
+                base_model.config.text_config.hidden_size,
+                base_model.config.projection_dim,
+                bias=False,
+            )
 
         for name, param in self.vision_model.named_parameters():
             if "lora_" not in name:
